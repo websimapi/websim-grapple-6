@@ -48,6 +48,10 @@ export class TrackManager {
         this.currentPos = new THREE.Vector3(0, 0, 0);
         this.currentDir = new THREE.Vector3(0, 0, 1); // Moving +Z
         this.segmentLength = 50;
+        
+        // Height Control
+        this.targetY = 0;
+        this.layerStep = 40;
 
         // Build initial straight
         this.addSegment('straight', 80, 0, 0, 0); // Flat start
@@ -202,8 +206,29 @@ export class TrackManager {
     }
 
     generateNextSegment() {
-        const maxAttempts = 10;
+        // Cleanup old segments to maintain performance
+        if (this.segments.length > 60) {
+            const oldSeg = this.segments.shift();
+            this.trackGroup.remove(oldSeg.mesh);
+            if (oldSeg.mesh.geometry) oldSeg.mesh.geometry.dispose();
+            // Note: Posts are in a separate array, but visual cleanup of track is main priority
+        }
+
+        const maxAttempts = 15;
         
+        // Update Target Height Layer
+        // If we are somewhat level with our target, maybe switch layers
+        if (Math.abs(this.currentPos.y - this.targetY) < 10 && Math.random() < 0.25) {
+            const dir = Math.random() > 0.5 ? 1 : -1;
+            let newTarget = this.targetY + (dir * this.layerStep);
+            
+            // Soft Bounds
+            if (newTarget > 120) newTarget -= this.layerStep * 2;
+            else if (newTarget < -120) newTarget += this.layerStep * 2;
+            
+            this.targetY = newTarget;
+        }
+
         for (let i = 0; i < maxAttempts; i++) {
             // Random parameters
             const type = Math.random() < 0.4 ? 'straight' : 'turn';
@@ -219,29 +244,29 @@ export class TrackManager {
                 angle = Math.PI / 2;
             }
 
-            // Slope generation: 30% chance to change elevation
-            slope = 0;
-            if (Math.random() < 0.4) {
-                // Determine slope based on current height to keep within bounds
-                // Soft bounds: -100 to 100
-                if (this.currentPos.y > 100) slope = -0.2 - Math.random() * 0.1;
-                else if (this.currentPos.y < -100) slope = 0.2 + Math.random() * 0.1;
-                else slope = (Math.random() - 0.5) * 0.6; // +/- 0.3 slope
-            }
+            // Slope Logic: Steer towards targetY
+            const heightDiff = this.targetY - this.currentPos.y;
+            // Calculate ideal slope to reach target over a reasonable distance
+            slope = heightDiff / (length * 1.5);
+
+            // Clamp slope
+            const maxSlope = 0.35; 
+            if (slope > maxSlope) slope = maxSlope;
+            if (slope < -maxSlope) slope = -maxSlope;
+            
+            // Add noise
+            slope += (Math.random() - 0.5) * 0.08;
 
             // Proposed OBB for checking
             const tempDir = this.currentDir.clone();
             const tempPos = this.currentPos.clone();
             
-            // Calculate center and dimensions of proposed segment
-            // (Simplified: check the main road part, ignore corner bit for now)
             const forwardOffset = tempDir.clone().multiplyScalar(length / 2);
             const center = tempPos.clone().add(forwardOffset);
             const segAngle = -Math.atan2(tempDir.x, tempDir.z);
 
             // Check Collision
             if (this.checkCollision(center, this.width, length, segAngle, slope, tempPos.y)) {
-                // If collision is bad (parallel or too close in height), retry
                 continue;
             }
 
@@ -250,53 +275,49 @@ export class TrackManager {
             return;
         }
 
-        // Fallback: Force a straight section with steep slope up to escape
-        this.addSegment('straight', 60, 0, 0, 0.4);
+        // Fallback: Force a steep escape towards target
+        const escapeSlope = (this.targetY > this.currentPos.y) ? 0.4 : -0.4;
+        this.addSegment('straight', 60, 0, 0, escapeSlope);
     }
 
     checkCollision(center, width, length, angle, slope, startY) {
         // Approximate height at center
         const centerY = startY + (length/2) * slope;
-        const heightClearance = 15; // Minimum vertical distance between roads
+        const heightClearance = 25; // 25m clearance for clean overpasses
 
-        // Check against recent segments (exclude very last 2 to allow connection)
+        // Optimization: Only check last 50 segments
+        const startIdx = Math.max(0, this.segments.length - 50);
         const checkCount = this.segments.length - 2;
         
-        for (let i = 0; i < checkCount; i++) {
+        for (let i = startIdx; i < checkCount; i++) {
             const other = this.segments[i];
             
-            // 1. Broad Phase: Distance check
+            // 1. Broad Phase
             if (center.distanceTo(other.mesh.position) > (length + other.length)) continue;
 
-            // 2. Narrow Phase: OBB Intersection in XZ plane
-            // Use width * 0.8 to be slightly lenient on edge grazes
+            // 2. Narrow Phase
             if (boxIntersectsBox(
                 center, width * 0.8, length, angle,
                 other.mesh.position, other.width * 0.8, other.length, other.angle
             )) {
-                // Overlap detected!
-                
-                // Check Angle difference (Parallel vs Crossing)
-                // Normalize angles to 0-PI
+                // Check Angle
                 let a1 = angle % Math.PI; if(a1<0) a1+=Math.PI;
                 let a2 = other.angle % Math.PI; if(a2<0) a2+=Math.PI;
                 let diff = Math.abs(a1 - a2);
                 if (diff > Math.PI/2) diff = Math.PI - diff;
 
-                const isParallel = diff < (Math.PI / 6); // < 30 degrees
+                const isParallel = diff < (Math.PI / 6); 
 
                 if (isParallel) {
-                    // Parallel overlap is NOT permitted
+                    // Parallel overlap is NOT permitted (no stacked roads)
                     return true;
                 } else {
                     // Crossing overlap
-                    // Check height difference
                     const otherY = other.mesh.position.y;
                     if (Math.abs(centerY - otherY) < heightClearance) {
                         // Crossing but too close vertically
                         return true; 
                     }
-                    // Else: Crossing with sufficient height - Permitted!
                 }
             }
         }
