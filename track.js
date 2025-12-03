@@ -16,7 +16,8 @@ export class TrackManager {
         this.roadTexture = loader.load('./asphalt_tile.png');
         this.roadTexture.wrapS = THREE.RepeatWrapping;
         this.roadTexture.wrapT = THREE.RepeatWrapping;
-        this.roadTexture.repeat.set(1, 4);
+        // REMOVED fixed repeat to allow dynamic UV scaling
+        // this.roadTexture.repeat.set(1, 4);
         
         // Texture Filtering for smoother look
         this.roadTexture.minFilter = THREE.LinearMipmapLinearFilter;
@@ -82,42 +83,30 @@ export class TrackManager {
         };
         
         // Visuals
-        const geo = new THREE.PlaneGeometry(this.width, Math.sqrt(length*length + endOffset.y*endOffset.y)); // Hypothenuse length
+        // Rotate geometry to lie on XZ plane with +Z as forward (length)
+        // This ensures lookAt works naturally and normals are correct
+        const geo = new THREE.PlaneGeometry(this.width, Math.sqrt(length*length + endOffset.y*endOffset.y)); 
+        
+        // Fix UVs to scale with length for consistent texture density
+        const uvAttribute = geo.attributes.uv;
+        const uvScale = length / 12; // Approx 1 tile per width unit
+        for ( let i = 0; i < uvAttribute.count; i ++ ) {
+            // v coordinate corresponds to the length axis after rotation
+            const v = uvAttribute.getY( i );
+            uvAttribute.setY( i, v * uvScale );
+        }
+        
+        geo.rotateX(-Math.PI / 2); // Rotate to XZ plane
+
         const mesh = new THREE.Mesh(geo, this.roadMat);
         
         // Position at midpoint
         const midPoint = new THREE.Vector3().lerpVectors(startPos, endPos, 0.5);
         mesh.position.copy(midPoint);
         
-        // Orientation: Look at end point from start point
+        // Orientation: Look at end point
+        // Since geometry +Z is length, this aligns perfectly
         mesh.lookAt(endPos);
-        
-        // Rotate local X to flatten it (PlaneGeometry is XY)
-        // lookAt aligns +Z to target. We want the plane (XY) to lie along the path.
-        // Actually, let's reset and do it manually for full control
-        // Default Plane is XY.
-        // We want Y-axis of plane to point along the path. 
-        // We want Z-axis of plane to point UP (normal).
-        
-        // Simpler approach with lookAt:
-        // Plane is XY. mesh.lookAt aligns -Z axis to target? No +Z usually.
-        // Let's rely on lookAt but rotate geometry so it aligns correctly.
-        // If we rotate geometry X by -PI/2, it becomes XZ plane.
-        // Then lookAt will align its Z axis (Normal) to the target... which is wrong. We want the Normal to be UP.
-        
-        // Correct approach:
-        // 1. Position at midpoint.
-        // 2. LookAt endPos.
-        // 3. Rotate 90deg on local X to make the plane flat.
-        mesh.lookAt(endPos); 
-        mesh.rotateX(-Math.PI / 2); // Now flat relative to the look direction
-        // Adjust for PlaneGeometry orientation (it's Y-up initially, rotating -90 X makes it Z-forward).
-        // But we want the texture to tile along Z?
-        // Plane UVs are 0..1 on X and Y.
-        // If we rotate X -90, Y axis of UV points along Z world (forward). This is good for tiling.
-        
-        // Important: Update rotation for OBB checks
-        // We store the 2D rotation for collision logic
         
         // Enable shadows
         mesh.receiveShadow = true;
@@ -133,31 +122,25 @@ export class TrackManager {
         if (type === 'turn') {
             // Corner patch
             const cornerGeo = new THREE.PlaneGeometry(this.width, this.width);
+            cornerGeo.rotateX(-Math.PI / 2); // Flat XZ
+            
             const cornerMesh = new THREE.Mesh(cornerGeo, this.roadMat);
-            cornerMesh.rotateX(-Math.PI / 2); // Flat
             
-            // Corner center needs to account for slope?
-            // Usually corners are flat or continue the slope.
-            // Simplified: Corners are flat connectors at the new elevation.
-            
-            // Position corner center: CurrentPos + Half Width forward *in new slope direction?*
-            // Simplifying: Assume corners are flat (slope 0) to avoid banking math headaches
-            // Or just continue the previous slope's rise for half-width.
-            
+            // Corner center
+            // Since slope is 0 for turns (enforced), math is simple
             const cornerOffset = this.currentDir.clone().multiplyScalar(this.width / 2);
-            cornerOffset.y = (this.width/2) * slope;
+            // Just in case slope wasn't 0, we maintain continuity, but visuals might break if not 0
+            cornerOffset.y = (this.width/2) * slope; 
+            
             const cornerCenter = this.currentPos.clone().add(cornerOffset);
             
             cornerMesh.position.copy(cornerCenter);
             
-            // Align rotation with incoming road (XZ)
-            // Pitch of corner matches incoming slope
-            cornerMesh.rotation.set(mesh.rotation.x, mesh.rotation.y, mesh.rotation.z); 
-            // Actually, mesh rotation is complex due to lookAt. 
-            // Let's just match the visual orientation of the end of the road.
+            // Align with incoming road
             cornerMesh.quaternion.copy(mesh.quaternion);
 
             this.trackGroup.add(cornerMesh);
+            cornerMesh.receiveShadow = true;
 
             this.segments.push({
                 type: 'corner',
@@ -238,24 +221,25 @@ export class TrackManager {
                 length = 80 + Math.random() * 60;
                 turnDir = 0;
                 angle = 0;
+                
+                // Slope Logic: Steer towards targetY
+                const heightDiff = this.targetY - this.currentPos.y;
+                slope = heightDiff / (length * 1.5);
+                
+                // Clamp slope
+                const maxSlope = 0.35; 
+                if (slope > maxSlope) slope = maxSlope;
+                if (slope < -maxSlope) slope = -maxSlope;
+                
+                // Add noise
+                slope += (Math.random() - 0.5) * 0.08;
+                
             } else {
                 length = 50 + Math.random() * 30;
                 turnDir = Math.random() > 0.5 ? 1 : -1;
                 angle = Math.PI / 2;
+                slope = 0; // CRITICAL: Turns must be flat to ensure geometry aligns at the 90 degree connector
             }
-
-            // Slope Logic: Steer towards targetY
-            const heightDiff = this.targetY - this.currentPos.y;
-            // Calculate ideal slope to reach target over a reasonable distance
-            slope = heightDiff / (length * 1.5);
-
-            // Clamp slope
-            const maxSlope = 0.35; 
-            if (slope > maxSlope) slope = maxSlope;
-            if (slope < -maxSlope) slope = -maxSlope;
-            
-            // Add noise
-            slope += (Math.random() - 0.5) * 0.08;
 
             // Proposed OBB for checking
             const tempDir = this.currentDir.clone();
